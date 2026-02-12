@@ -1640,6 +1640,50 @@ class TestBudgetTracking:
         rlm = RLM("query -> answer")
         assert rlm.max_cost is None
 
+    def test_max_tokens_initialization(self):
+        """Test that max_tokens is stored on the RLM instance."""
+        rlm = RLM("query -> answer", max_tokens=10_000)
+        assert rlm.max_tokens == 10_000
+
+    def test_max_tokens_default_none(self):
+        """Test that max_tokens defaults to None (no limit)."""
+        rlm = RLM("query -> answer")
+        assert rlm.max_tokens is None
+
+    def test_budget_shows_tokens_when_max_tokens_set(self):
+        """Test that budget() includes token info when max_tokens is configured."""
+        from unittest.mock import MagicMock
+
+        mock_lm = MagicMock(return_value=["response"])
+        mock_lm.history = []
+        rlm = RLM("query -> answer", max_tokens=1000, sub_lm=mock_lm)
+        execution_state = {"start_time": __import__("time").monotonic(), "iteration": 0}
+        tools = rlm._make_llm_tools(execution_state=execution_state)
+
+        mock_lm.history.append({"usage": {"total_tokens": 250}})
+        result = tools["budget"]()
+        assert "Tokens:" in result
+        assert "750/1000 remaining" in result
+
+    def test_max_tokens_zero_triggers_immediate_fallback(self):
+        """Test that max_tokens=0 triggers extract fallback immediately."""
+        from unittest.mock import MagicMock
+
+        mock_lm = MagicMock(return_value=["response"])
+        mock_lm.history = [{"usage": {"total_tokens": 1}}]
+
+        mock = MockInterpreter(responses=["exploring..."])
+        rlm = RLM("query -> answer", max_iterations=5, max_tokens=0, sub_lm=mock_lm, interpreter=mock)
+        rlm.generate_action = make_mock_predictor([
+            {"reasoning": "Explore", "code": "print('exploring')"},
+        ])
+        rlm.extract = make_mock_predictor([
+            {"answer": "token_fallback"},
+        ])
+
+        result = rlm.forward(query="test")
+        assert result.answer == "token_fallback"
+
     def test_budget_shows_cost_when_max_cost_set(self):
         """Test that budget() includes cost info when max_cost is configured."""
         rlm = RLM("query -> answer", max_iterations=5, max_llm_calls=10, max_cost=0.50)
@@ -2519,6 +2563,47 @@ class TestSubcallCostBudgetPropagation:
 
         result = rlm._subcall("test", execution_state=execution_state)
         assert "Cost budget exhausted" in result
+
+
+class TestSubcallTokenBudgetPropagation:
+    """Tests for max_tokens propagation to child RLM."""
+
+    def test_child_receives_remaining_tokens(self):
+        """When parent has max_tokens and some usage, child gets remaining tokens."""
+        from unittest.mock import patch
+
+        captured_child_kwargs = {}
+        _original_init = RLM.__init__
+
+        def capturing_init(self_inner, *args, **kwargs):
+            sig = args[0] if args else kwargs.get("signature", "")
+            if sig == "prompt -> response":
+                captured_child_kwargs.update(kwargs)
+            _original_init(self_inner, *args, **kwargs)
+
+        rlm = RLM("query -> answer", max_iterations=3, max_depth=2, max_tokens=10_000)
+        execution_state = {
+            "start_time": _time.monotonic(),
+            "iteration": 0,
+            "_get_cost_and_tokens": lambda: (0.0, 2_500),
+        }
+
+        with patch.object(RLM, "__init__", capturing_init):
+            rlm._subcall("test", execution_state=execution_state)
+
+        assert captured_child_kwargs.get("max_tokens") == 7_500
+
+    def test_subcall_returns_error_when_tokens_exhausted(self):
+        """When token budget is exhausted, _subcall returns error string."""
+        rlm = RLM("query -> answer", max_iterations=3, max_depth=2, max_tokens=1000)
+        execution_state = {
+            "start_time": _time.monotonic(),
+            "iteration": 0,
+            "_get_cost_and_tokens": lambda: (0.0, 1200),
+        }
+
+        result = rlm._subcall("test", execution_state=execution_state)
+        assert "Token budget exhausted" in result
 
 
 class TestSubcallModelOverride:

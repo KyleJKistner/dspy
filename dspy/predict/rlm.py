@@ -61,7 +61,7 @@ Available:
 - `llm_query_with_media(prompt, *media_var_names, model=None)` - query sub-LLM with media (audio/image) attached{media_docs}
 - `print()` - ALWAYS print to see results
 - `SUBMIT({final_output_names})` - submit final output when done
-- `budget()` - check remaining iterations, LLM calls, and time
+- `budget()` - check remaining iterations, LLM calls, time, cost, and tokens
 - Standard libraries: re, json, collections, math, etc.
 
 IMPORTANT: This is ITERATIVE. Each code block you write will execute, you'll see the output, then you decide what to do next. Do NOT try to solve everything in one step.
@@ -119,6 +119,7 @@ class RLM(Module):
         max_output_chars: int = 10_000,
         max_time: float | None = None,
         max_cost: float | None = None,
+        max_tokens: int | None = None,
         verbose: bool = False,
         tools: list[Callable] | None = None,
         sub_lm: dspy.LM | None = None,
@@ -139,6 +140,9 @@ class RLM(Module):
             max_cost: Maximum dollar cost per forward() call. None means no limit.
                      Tracked via litellm's per-call cost reporting. The agent can
                      check remaining cost via budget().
+            max_tokens: Maximum token usage per forward() call across all configured
+                       LMs (tracked from LM history usage.total_tokens). None means no limit.
+                       The agent can check remaining tokens via budget().
             verbose: Whether to log detailed execution info.
             tools: List of tool functions or dspy.Tool objects callable from interpreter code.
                   Built-in tools: llm_query(prompt), llm_query_batched(prompts).
@@ -160,6 +164,7 @@ class RLM(Module):
         self.max_output_chars = max_output_chars
         self.max_time = max_time
         self.max_cost = max_cost
+        self.max_tokens = max_tokens
         self.verbose = verbose
         self.sub_lm = sub_lm
         self.sub_lms = sub_lms or {}
@@ -168,6 +173,8 @@ class RLM(Module):
             raise ValueError(f"max_depth must be >= 1, got {max_depth}")
         if depth < 0:
             raise ValueError(f"depth must be >= 0, got {depth}")
+        if max_tokens is not None and max_tokens < 0:
+            raise ValueError(f"max_tokens must be >= 0, got {max_tokens}")
         self.depth = depth
         self.max_depth = max_depth
         self._user_tools = self._normalize_tools(tools)
@@ -422,6 +429,7 @@ class RLM(Module):
         max_llm_calls = self.max_llm_calls
         max_time = self.max_time
         max_cost = self.max_cost
+        max_tokens = self.max_tokens
 
         def _get_cost_and_tokens() -> tuple[float, int]:
             """Sum cost and tokens from LM history entries added since tool creation.
@@ -486,6 +494,14 @@ class RLM(Module):
                 parts.append(f"Time: no limit ({elapsed:.1f}s elapsed)")
 
             cost_spent, tokens_used = _get_cost_and_tokens()
+            if max_tokens is not None:
+                remaining_tokens = max(0, max_tokens - tokens_used)
+                parts.append(f"Tokens: {remaining_tokens}/{max_tokens} remaining ({tokens_used} used)")
+                if remaining_tokens <= max(1, int(max_tokens * 0.2)):
+                    warnings.append(f"tokens ({remaining_tokens} left)")
+            elif tokens_used > 0:
+                parts.append(f"Tokens: no limit ({tokens_used} used)")
+
             if max_cost is not None:
                 remaining_cost = max(0.0, max_cost - cost_spent)
                 parts.append(f"Cost: ${remaining_cost:.4f}/${max_cost:.4f} remaining (${cost_spent:.4f} spent, {tokens_used:,} tokens)")
@@ -778,6 +794,16 @@ class RLM(Module):
                 if remaining_cost <= 0:
                     return "Error: Cost budget exhausted"
 
+        # Calculate remaining token budget for child
+        remaining_tokens = None
+        if self.max_tokens is not None:
+            get_cost = _execution_state.get("_get_cost_and_tokens")
+            if get_cost is not None:
+                _, tokens_used = get_cost()
+                remaining_tokens = max(0, self.max_tokens - tokens_used)
+                if remaining_tokens <= 0:
+                    return "Error: Token budget exhausted"
+
         # Resolve child's sub_lm: model param selects which LM the child uses
         child_sub_lm = resolve_lm(model) if (model and resolve_lm) else self.sub_lm
 
@@ -801,6 +827,7 @@ class RLM(Module):
             max_output_chars=self.max_output_chars,
             max_time=remaining_time,
             max_cost=remaining_cost,
+            max_tokens=remaining_tokens,
             verbose=self.verbose,
             tools=list(self._user_tools.values()) if self._user_tools else None,
             sub_lm=child_sub_lm,
@@ -1039,6 +1066,18 @@ class RLM(Module):
                             )
                             return self._extract_fallback(variables, history, output_field_names)
 
+                # Check token budget before starting iteration
+                if self.max_tokens is not None:
+                    get_cost = execution_state.get("_get_cost_and_tokens")
+                    if get_cost is not None:
+                        _, tokens_used = get_cost()
+                        if tokens_used > self.max_tokens:
+                            logger.warning(
+                                f"RLM token budget exceeded ({tokens_used} > {self.max_tokens}) "
+                                f"at iteration {iteration + 1}, using extract fallback"
+                            )
+                            return self._extract_fallback(variables, history, output_field_names)
+
                 result: Prediction | REPLHistory = self._execute_iteration(
                     repl, variables, history, iteration, input_args, output_field_names
                 )
@@ -1152,6 +1191,18 @@ class RLM(Module):
                         if cost_spent > self.max_cost:
                             logger.warning(
                                 f"RLM cost budget exceeded (${cost_spent:.4f} > ${self.max_cost:.4f}) "
+                                f"at iteration {iteration + 1}, using extract fallback"
+                            )
+                            return await self._aextract_fallback(variables, history, output_field_names)
+
+                # Check token budget before starting iteration
+                if self.max_tokens is not None:
+                    get_cost = execution_state.get("_get_cost_and_tokens")
+                    if get_cost is not None:
+                        _, tokens_used = get_cost()
+                        if tokens_used > self.max_tokens:
+                            logger.warning(
+                                f"RLM token budget exceeded ({tokens_used} > {self.max_tokens}) "
                                 f"at iteration {iteration + 1}, using extract fallback"
                             )
                             return await self._aextract_fallback(variables, history, output_field_names)

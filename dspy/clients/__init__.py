@@ -6,6 +6,7 @@ import litellm
 
 from dspy.clients.base_lm import BaseLM, inspect_history
 from dspy.clients.cache import Cache
+from dspy.clients.codex_cli import CodexCLI
 from dspy.clients.embedding import Embedder
 from dspy.clients.lm import LM
 from dspy.clients.provider import Provider, TrainingJob
@@ -111,6 +112,7 @@ disable_litellm_logging()
 
 __all__ = [
     "BaseLM",
+    "CodexCLI",
     "LM",
     "Provider",
     "TrainingJob",
