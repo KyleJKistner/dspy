@@ -749,6 +749,45 @@ asyncio.get_event_loop().run_until_complete(pyfetch("https://example.com"))
 """)
             assert "net access" in str(exc_info.value).lower() or "allow-net" in str(exc_info.value).lower()
 
+    def test_no_host_filesystem_access(self, tmp_path):
+        """Test that host filesystem access is blocked unless explicitly enabled."""
+        import json
+
+        canary = tmp_path / "canary.txt"
+        canary.write_text("CANARY", encoding="utf-8")
+        canary_path = str(canary)
+
+        with PythonInterpreter(tools={}) as interp:
+            with pytest.raises(CodeInterpreterError):
+                interp.execute(
+                    f"""
+with open({json.dumps(canary_path)}, "r", encoding="utf-8") as f:
+    print(f.read())
+"""
+                )
+
+        # If we explicitly allow reading that path, it should succeed.
+        with PythonInterpreter(tools={}, enable_read_paths=[canary_path]) as interp:
+            virtual_path = f"/sandbox/{canary.name}"
+            result = interp.execute(
+                f"""
+with open({json.dumps(virtual_path)}, "r", encoding="utf-8") as f:
+    print(f.read())
+"""
+            )
+            assert "CANARY" in result
+
+    def test_no_process_spawn(self):
+        """Test that process execution is blocked in the sandbox."""
+        with PythonInterpreter(tools={}) as interp:
+            with pytest.raises(CodeInterpreterError):
+                interp.execute(
+                    """
+import subprocess
+subprocess.run(["/bin/echo", "hi"], check=True)
+"""
+                )
+
     def test_imports_work(self):
         """Test that standard library imports work."""
         with PythonInterpreter(tools={}) as interp:
@@ -760,6 +799,33 @@ data = {"key": "value"}
 print(json.dumps(data))
 """)
             assert "key" in result
+
+
+@pytest.mark.deno
+class TestRLMSandboxDefaults:
+    """Integration tests proving RLM uses the sandboxed PythonInterpreter by default."""
+
+    def test_rlm_cannot_read_host_file_by_default(self, tmp_path):
+        """RLM default interpreter should not be able to read a host file path via open()."""
+        canary = tmp_path / "rlm_canary.txt"
+        canary.write_text("CANARY", encoding="utf-8")
+
+        with dummy_lm_context([
+            {
+                "reasoning": "Try to read a host file directly.",
+                "code": (
+                    "try:\n"
+                    "    with open(canary_path, 'r', encoding='utf-8') as f:\n"
+                    "        SUBMIT(answer='READ:' + f.read())\n"
+                    "except Exception as e:\n"
+                    "    SUBMIT(answer='BLOCKED:' + type(e).__name__)\n"
+                ),
+            },
+        ]):
+            rlm = RLM("canary_path -> answer", max_iterations=2)
+            out = rlm(canary_path=str(canary))
+            assert isinstance(out.answer, str)
+            assert out.answer.startswith("BLOCKED:")
 
 
 # ============================================================================
@@ -2783,7 +2849,7 @@ class TestSubcallParameterPropagation:
 
 
 class TestSubcallInterpreterIsolation:
-    """Tests that child RLM gets an isolated LocalInterpreter."""
+    """Tests that child RLM gets an isolated interpreter for recursive subcalls."""
 
     def test_child_gets_local_interpreter_when_parent_uses_local(self):
         """When parent uses LocalInterpreter, child gets LocalInterpreter."""
@@ -2805,8 +2871,8 @@ class TestSubcallInterpreterIsolation:
             rlm._subcall("test")
         assert isinstance(captured.get("interpreter"), LocalInterpreter)
 
-    def test_child_gets_python_interpreter_when_parent_uses_default(self):
-        """When parent uses default (PythonInterpreter), child matches."""
+    def test_child_gets_local_interpreter_when_parent_uses_default(self):
+        """When parent uses default interpreter, child stays sandboxed by default."""
         from unittest.mock import patch
 
         captured = {}
@@ -2822,7 +2888,7 @@ class TestSubcallInterpreterIsolation:
         rlm = RLM("query -> answer", max_depth=2)
         with patch.object(RLM, "__init__", capturing_init):
             rlm._subcall("test")
-        assert isinstance(captured.get("interpreter"), PythonInterpreter)
+        assert captured.get("interpreter") is None
 
     def test_interpreter_shutdown_on_success(self):
         """Child interpreter shutdown() is called after successful completion."""
@@ -2881,7 +2947,7 @@ class TestSubcallE2E:
         with dummy_lm_context([
             {"reasoning": "Answer directly", "code": 'SUBMIT(response="42")'},
         ]):
-            rlm = RLM("query -> answer", max_iterations=3, max_depth=2)
+            rlm = RLM("query -> answer", max_iterations=3, max_depth=2, unsafe_local_subcalls=True)
             tools = rlm._make_llm_tools()
             result = tools["llm_query"]("What is 6*7?")
             assert result == "42"
@@ -2891,7 +2957,7 @@ class TestSubcallE2E:
         with dummy_lm_context([
             {"reasoning": "Use the prompt", "code": 'SUBMIT(response=f"Got: {prompt}")'},
         ]):
-            rlm = RLM("query -> answer", max_iterations=3, max_depth=2)
+            rlm = RLM("query -> answer", max_iterations=3, max_depth=2, unsafe_local_subcalls=True)
             tools = rlm._make_llm_tools()
             result = tools["llm_query"]("hello world")
             assert result == "Got: hello world"
@@ -2907,7 +2973,7 @@ class TestSubcallE2E:
         with dummy_lm_context([
             {"reasoning": "Use tool", "code": 'val = my_tool(x="hi")\nSUBMIT(response=val)'},
         ]):
-            rlm = RLM("query -> answer", max_iterations=3, max_depth=2, tools=[my_tool])
+            rlm = RLM("query -> answer", max_iterations=3, max_depth=2, tools=[my_tool], unsafe_local_subcalls=True)
             tools = rlm._make_llm_tools()
             result = tools["llm_query"]("use tool")
             assert result == "tool(hi)"
@@ -2919,7 +2985,7 @@ class TestSubcallE2E:
             {"reasoning": "Explore first", "code": 'x = len(prompt)\nprint(f"length={x}")'},
             {"reasoning": "Now submit", "code": "SUBMIT(response=str(x))"},
         ]):
-            rlm = RLM("query -> answer", max_iterations=5, max_depth=2)
+            rlm = RLM("query -> answer", max_iterations=5, max_depth=2, unsafe_local_subcalls=True)
             tools = rlm._make_llm_tools()
             result = tools["llm_query"]("hello")
             assert result == "5"
@@ -2930,7 +2996,7 @@ class TestSubcallE2E:
             {"reasoning": "Crash", "code": 'raise RuntimeError("boom")'},
             {"response": "recovered"},  # extract fallback
         ]):
-            rlm = RLM("query -> answer", max_iterations=1, max_depth=2)
+            rlm = RLM("query -> answer", max_iterations=1, max_depth=2, unsafe_local_subcalls=True)
             tools = rlm._make_llm_tools()
             result = tools["llm_query"]("test")
             # Should get a string back (either "recovered" from extract or error message)
@@ -2944,7 +3010,7 @@ class TestSubcallE2E:
             # Child 2
             {"reasoning": "Second", "code": 'SUBMIT(response="a2")'},
         ]):
-            rlm = RLM("query -> answer", max_iterations=3, max_depth=2, max_llm_calls=20)
+            rlm = RLM("query -> answer", max_iterations=3, max_depth=2, max_llm_calls=20, unsafe_local_subcalls=True)
             tools = rlm._make_llm_tools()
             results = tools["llm_query_batched"](["q1", "q2"])
             assert results == ["a1", "a2"]
@@ -2968,15 +3034,15 @@ class TestSubcallE2E:
 
     @pytest.mark.deno
     def test_depth_2_python_interpreter_parent(self):
-        """Parent uses PythonInterpreter (Deno), child uses LocalInterpreter.
+        """Parent uses PythonInterpreter (Deno), child stays sandboxed by default.
 
         llm_query is a host-side tool callback (JSON-RPC from Deno), so _subcall
-        runs on the host and creates the child with its own LocalInterpreter.
+        runs on the host and creates the child (sandboxed unless unsafe_local_subcalls=True).
         """
         with dummy_lm_context([
             # Parent iter 1: call llm_query (triggers child RLM)
             {"reasoning": "Delegate", "code": 'result = llm_query("compute 2+2")\nprint(result)'},
-            # Child iter 1 (runs in LocalInterpreter): SUBMIT response
+            # Child iter 1 (runs in child REPL): SUBMIT response
             {"reasoning": "Easy", "code": 'SUBMIT(response="4")'},
             # Parent iter 2: SUBMIT the child's result
             {"reasoning": "Done", "code": "SUBMIT(result)"},

@@ -61,9 +61,30 @@ def test_codex_cli_renders_chat_messages(monkeypatch):
 
     assert result == ["ok"]
     rendered = captured_prompt["input"]
+    assert "You are being used as a pure language model backend for DSPy." not in rendered
     assert "SYSTEM:\nBe terse." in rendered
     assert "USER:\nDescribe this image" in rendered
     assert "[image_url: https://example.com/cat.png]" in rendered
+
+
+def test_codex_cli_chat_prompt_mode_includes_plain_backend_preamble(monkeypatch):
+    captured_prompt = {}
+
+    def fake_run(cmd, **kwargs):
+        captured_prompt["input"] = kwargs["input"]
+        out_file = cmd[cmd.index("--output-last-message") + 1]
+        Path(out_file).write_text("ok", encoding="utf-8")
+        return _fake_completed_process(cmd)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    lm = dspy.CodexCLI(prompt_mode="chat")
+    result = lm(messages=[{"role": "user", "content": "hello"}])
+
+    assert result == ["ok"]
+    rendered = captured_prompt["input"]
+    assert "You are being used as a pure language model backend for DSPy." in rendered
+    assert "ASSISTANT:" in rendered
 
 
 def test_codex_cli_supports_n_outputs(monkeypatch):
@@ -94,4 +115,3 @@ def test_codex_cli_raises_on_command_failure(monkeypatch):
     lm = dspy.CodexCLI()
     with pytest.raises(RuntimeError, match="codex exec failed"):
         lm("fail please")
-

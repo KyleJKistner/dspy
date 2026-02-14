@@ -66,3 +66,7 @@ docs/docs/**/*.json*
 
 test_before_pypi/
 .github/.internal_dspyai/dist/
+
+# Local dev tooling / machine-specific artifacts
+.claude/settings.local.json
+verified-bundle.json

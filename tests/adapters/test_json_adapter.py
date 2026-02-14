@@ -115,6 +115,24 @@ def test_json_adapter_sync_call():
     assert result == [{"answer": "Paris"}]
 
 
+def test_json_adapter_repair_recovers_from_non_json_completion():
+    signature = dspy.make_signature("question->reasoning, code")
+    # Simulate a model that ignores the JSON schema and returns non-JSON text.
+    primary_lm = dspy.utils.DummyLM([{"answer": "### Codepath Deep Dive\n\nThis is not JSON."}])
+
+    # Repair LM returns the required schema as JSON so the adapter can parse it.
+    repair_lm = dspy.utils.DummyLM(
+        [{"reasoning": "ok", "code": "print('hi')"}],
+        adapter=dspy.JSONAdapter(repair=False),
+    )
+
+    adapter = dspy.JSONAdapter(repair=True, repair_lm=repair_lm, repair_max_attempts=1)
+    with dspy.context(adapter=adapter):
+        result = adapter(primary_lm, {}, signature, [], {"question": "x"})
+
+    assert result == [{"reasoning": "ok", "code": "print('hi')"}]
+
+
 @pytest.mark.asyncio
 async def test_json_adapter_async_call():
     signature = dspy.make_signature("question->answer")

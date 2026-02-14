@@ -127,6 +127,7 @@ class RLM(Module):
         interpreter: CodeInterpreter | None = None,
         depth: int = 0,
         max_depth: int = 1,
+        unsafe_local_subcalls: bool | None = None,
     ):
         """
         Args:
@@ -152,10 +153,17 @@ class RLM(Module):
                     a specific model via llm_query(prompt, model="name"). When model is None,
                     falls back to sub_lm, then dspy.settings.lm.
             interpreter: CodeInterpreter implementation to use. Defaults to PythonInterpreter.
+            unsafe_local_subcalls: Controls whether recursive llm_query() subcalls spawn child RLMs
+                    that execute code via the UNSANDBOXED LocalInterpreter (host Python `exec`).
+                    - None (default): infer from `interpreter` (LocalInterpreter => True, else False)
+                    - False: keep subcalls sandboxed (child uses PythonInterpreter)
+                    - True: use LocalInterpreter for child REPL (UNSANDBOXED)
             depth: Current recursion depth (0-indexed). Used internally when spawning child RLMs.
             max_depth: Maximum recursion depth. When depth < max_depth - 1, llm_query spawns
-                      a child RLM with its own REPL (LocalInterpreter). At leaf depth, falls
-                      back to plain LM completion. Default 1 means no recursion (current behavior).
+                      a child RLM with its own REPL. By default, the child REPL is sandboxed
+                      (PythonInterpreter). Set unsafe_local_subcalls=True to use LocalInterpreter
+                      (UNSANDBOXED). At leaf depth, falls back to plain LM completion. Default 1
+                      means no recursion (current behavior).
         """
         super().__init__()
         self.signature = ensure_signature(signature)
@@ -169,6 +177,16 @@ class RLM(Module):
         self.sub_lm = sub_lm
         self.sub_lms = sub_lms or {}
         self._interpreter = interpreter
+        if unsafe_local_subcalls is None:
+            inferred = False
+            try:
+                from dspy.primitives.local_interpreter import LocalInterpreter
+                inferred = isinstance(interpreter, LocalInterpreter)
+            except Exception:
+                inferred = False
+            self.unsafe_local_subcalls = inferred
+        else:
+            self.unsafe_local_subcalls = unsafe_local_subcalls
         if max_depth < 1:
             raise ValueError(f"max_depth must be >= 1, got {max_depth}")
         if depth < 0:
@@ -372,7 +390,7 @@ class RLM(Module):
             _check_and_increment(len(prompts))
 
             if _use_recursive:
-                # Sequential: each child spawns its own LocalInterpreter
+                # Sequential: each prompt spawns a child RLM (with its own REPL).
                 results = []
                 for p in prompts:
                     try:
@@ -754,12 +772,11 @@ class RLM(Module):
         execution_state: dict[str, Any] | None = None,
         resolve_lm: Callable | None = None,
     ) -> str:
-        """Spawn a child RLM with its own LocalInterpreter REPL.
+        """Spawn a child RLM for a recursive llm_query() call.
 
         Called by llm_query/llm_query_batched when depth < max_depth - 1.
-        The child gets a fresh REPL and can write code, call llm_query (which
-        recurses further or falls back to plain LM at leaf depth), and SUBMIT
-        a response. Mirrors the vanilla RLM's _subcall pattern.
+        By default, the child is sandboxed (PythonInterpreter). If
+        unsafe_local_subcalls=True, the child uses LocalInterpreter (UNSANDBOXED).
 
         Args:
             prompt: The prompt to pass as the child's input.
@@ -770,8 +787,6 @@ class RLM(Module):
         Returns:
             The child's response string, or an error string on failure.
         """
-        from dspy.primitives.local_interpreter import LocalInterpreter
-
         _execution_state = execution_state or {}
 
         # Calculate remaining time budget for child
@@ -807,18 +822,25 @@ class RLM(Module):
         # Resolve child's sub_lm: model param selects which LM the child uses
         child_sub_lm = resolve_lm(model) if (model and resolve_lm) else self.sub_lm
 
-        # Match parent's interpreter type: if parent uses LocalInterpreter (or a
-        # custom interpreter), child gets a fresh LocalInterpreter. If parent uses
-        # the default PythonInterpreter (Deno sandbox), child gets its own
-        # PythonInterpreter so sandboxing is preserved.
-        if isinstance(self._interpreter, LocalInterpreter):
+        def _plain_lm(prompt: str) -> str:
+            """Fallback: plain LM completion without a child REPL."""
+            target_lm = child_sub_lm or dspy.settings.lm
+            response = target_lm(prompt)
+            if isinstance(response, list) and response:
+                item = response[0]
+                if isinstance(item, dict) and "text" in item:
+                    return item["text"]
+                return str(item)
+            return str(response)
+
+        interpreter: CodeInterpreter | None
+        if self.unsafe_local_subcalls:
+            from dspy.primitives.local_interpreter import LocalInterpreter
+            # UNSANDBOXED: host Python execution for child REPL.
             interpreter = LocalInterpreter()
-        elif self._interpreter is None:
-            # Parent uses default PythonInterpreter — child gets one too
-            interpreter = PythonInterpreter()
         else:
-            # Custom interpreter — can't clone, fall back to LocalInterpreter
-            interpreter = LocalInterpreter()
+            # Sandboxed: let the child create a PythonInterpreter instance in its forward() call.
+            interpreter = None
 
         child = RLM(
             signature="prompt -> response",
@@ -833,6 +855,7 @@ class RLM(Module):
             sub_lm=child_sub_lm,
             sub_lms=self.sub_lms,
             interpreter=interpreter,
+            unsafe_local_subcalls=self.unsafe_local_subcalls,
             depth=self.depth + 1,
             max_depth=self.max_depth,
         )
@@ -841,9 +864,17 @@ class RLM(Module):
             result = child(prompt=prompt)
             return result.response
         except Exception as e:
+            # Prefer a safe answer over a hard failure when recursion is enabled but
+            # the sandbox runtime isn't available (e.g., Deno missing).
+            if not self.unsafe_local_subcalls:
+                try:
+                    return _plain_lm(prompt)
+                except Exception:
+                    pass
             return f"Error: Child RLM failed - {e}"
         finally:
-            interpreter.shutdown()
+            if interpreter is not None:
+                interpreter.shutdown()
 
     @contextmanager
     def _interpreter_context(self, execution_tools: dict[str, Callable]) -> Iterator[CodeInterpreter]:

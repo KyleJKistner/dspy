@@ -1,3 +1,4 @@
+import os
 import json
 import logging
 from typing import Any, get_origin
@@ -9,6 +10,7 @@ import regex
 from pydantic.fields import FieldInfo
 
 from dspy.adapters.chat_adapter import ChatAdapter, FieldInfoWithName
+from dspy.adapters.types import Type
 from dspy.adapters.types.tool import ToolCalls
 from dspy.adapters.utils import (
     format_field_value,
@@ -39,9 +41,199 @@ def _has_open_ended_mapping(signature: SignatureMeta) -> bool:
 
 
 class JSONAdapter(ChatAdapter):
-    def __init__(self, callbacks: list[BaseCallback] | None = None, use_native_function_calling: bool = True):
+    def __init__(
+        self,
+        callbacks: list[BaseCallback] | None = None,
+        use_native_function_calling: bool = True,
+        *,
+        repair: bool | None = None,
+        repair_lm: LM | None = None,
+        repair_max_attempts: int = 1,
+    ):
         # JSONAdapter uses native function calling by default.
         super().__init__(callbacks=callbacks, use_native_function_calling=use_native_function_calling)
+
+        # Optional, off-by-default JSON repair pass. Enable with either:
+        #   - dspy.JSONAdapter(repair=True)
+        #   - DSPY_JSON_ADAPTER_REPAIR=1 (useful for CLI runs)
+        if repair is None:
+            repair = os.getenv("DSPY_JSON_ADAPTER_REPAIR", "").strip().lower() in {"1", "true", "yes"}
+        if repair_max_attempts < 0:
+            raise ValueError("repair_max_attempts must be >= 0")
+        if repair_lm is not None and not isinstance(repair_lm, LM):
+            raise ValueError("repair_lm must be an instance of dspy.LM")
+        self.repair = bool(repair)
+        self.repair_lm = repair_lm
+        self.repair_max_attempts = repair_max_attempts
+
+    def _supports_response_format(self, lm: LM) -> bool:
+        provider = lm.model.split("/", 1)[0] or "openai"
+        params = litellm.get_supported_openai_params(model=lm.model, custom_llm_provider=provider)
+        return bool(params) and "response_format" in params
+
+    def _build_repair_messages(self, signature: type[Signature], bad_completion: str) -> list[dict[str, Any]]:
+        ordered_keys = list(signature.output_fields.keys())
+        schema_lines = [
+            f'- "{name}": {get_annotation_name(field.annotation)}'
+            for name, field in signature.output_fields.items()
+        ]
+        system = (
+            "You are a strict JSON reformatter. "
+            "Convert the provided text into a single JSON object that matches the required schema.\n\n"
+            "Rules:\n"
+            "- Output ONLY the JSON object. No Markdown, no code fences, no extra text.\n"
+            f"- The JSON object MUST contain exactly these keys, in this exact order: {', '.join(ordered_keys)}.\n"
+            "- Do not add any other keys.\n"
+            "- Extract values from the text as-is when possible; do not invent new information.\n"
+            "- If a value is missing, use a reasonable empty default that still matches the expected type "
+            "(e.g., \"\" for strings, false for booleans, 0 for numbers, [] for arrays, {} for objects).\n\n"
+            "Schema (key -> type):\n" + "\n".join(schema_lines)
+        )
+        user = (
+            "Text to convert:\n"
+            """\
+"""
+            + bad_completion
+            + """\
+"""  # Keep raw text verbatim.
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+    def _repair_via_lm(
+        self,
+        *,
+        lm: LM,
+        lm_kwargs: dict[str, Any],
+        signature: type[Signature],
+        bad_completion: str,
+    ) -> str:
+        repair_lm = self.repair_lm or lm
+        messages = self._build_repair_messages(signature=signature, bad_completion=bad_completion)
+
+        repair_kwargs = dict(lm_kwargs)
+        # Ensure repair is a simple text->json pass, not a tools/functions invocation.
+        repair_kwargs.pop("tools", None)
+        repair_kwargs.pop("tool_choice", None)
+        repair_kwargs.pop("functions", None)
+        repair_kwargs.pop("function_call", None)
+        repair_kwargs.pop("logprobs", None)
+        repair_kwargs.pop("stream", None)
+        repair_kwargs.pop("response_format", None)
+        repair_kwargs["n"] = 1
+
+        if self._supports_response_format(repair_lm):
+            repair_kwargs["response_format"] = {"type": "json_object"}
+
+        outputs = repair_lm(messages=messages, **repair_kwargs)
+        if not outputs:
+            return ""
+        output0 = outputs[0]
+        if isinstance(output0, dict):
+            return output0.get("text") or ""
+        return str(output0)
+
+    def _parse_with_optional_repair(
+        self,
+        *,
+        processed_signature: type[Signature],
+        completion_text: str,
+        lm: LM,
+        lm_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            return self.parse(processed_signature, completion_text)
+        except Exception as original_err:
+            if not self.repair or self.repair_max_attempts <= 0:
+                raise
+
+            last_err: Exception = original_err
+            for _ in range(self.repair_max_attempts):
+                repaired = self._repair_via_lm(
+                    lm=lm,
+                    lm_kwargs=lm_kwargs,
+                    signature=processed_signature,
+                    bad_completion=completion_text,
+                )
+                try:
+                    return self.parse(processed_signature, repaired)
+                except Exception as err:
+                    last_err = err
+
+            # Preserve the original response in the error, but mention repair failure.
+            raise AdapterParseError(
+                adapter_name="JSONAdapter",
+                signature=processed_signature,
+                lm_response=completion_text,
+                message=f"JSON repair failed after {self.repair_max_attempts} attempt(s). Last error: {last_err}",
+            ) from original_err
+
+    def _call_postprocess(
+        self,
+        processed_signature: type[Signature],
+        original_signature: type[Signature],
+        outputs: list[dict[str, Any] | str],
+        lm: LM,
+        lm_kwargs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        # Override base postprocess to optionally repair malformed/non-JSON completions.
+        values: list[dict[str, Any]] = []
+
+        tool_call_output_field_name = self._get_tool_call_output_field_name(original_signature)
+
+        for output in outputs:
+            output_logprobs = None
+            tool_calls = None
+            text = output
+
+            if isinstance(output, dict):
+                text = output.get("text")
+                output_logprobs = output.get("logprobs")
+                tool_calls = output.get("tool_calls")
+
+            if text:
+                value = self._parse_with_optional_repair(
+                    processed_signature=processed_signature,
+                    completion_text=str(text),
+                    lm=lm,
+                    lm_kwargs=lm_kwargs,
+                )
+                for field_name in original_signature.output_fields.keys():
+                    if field_name not in value:
+                        # We need to set the field not present in the processed signature to None for consistency.
+                        value[field_name] = None
+            else:
+                value = {field_name: None for field_name in original_signature.output_fields.keys()}
+
+            if tool_calls and tool_call_output_field_name:
+                tool_calls = [
+                    {
+                        "name": v["function"]["name"],
+                        "args": json_repair.loads(v["function"]["arguments"]),
+                    }
+                    for v in tool_calls
+                ]
+                value[tool_call_output_field_name] = ToolCalls.from_dict_list(tool_calls)
+
+            # Parse custom types that does not rely on the `Adapter.parse()` method
+            for name, field in original_signature.output_fields.items():
+                if (
+                    isinstance(field.annotation, type)
+                    and issubclass(field.annotation, Type)
+                    and field.annotation in self.native_response_types
+                ):
+                    parsed_value = field.annotation.parse_lm_response(output)
+                    if parsed_value is not None:
+                        value[name] = parsed_value
+
+            if output_logprobs is not None:
+                value["logprobs"] = output_logprobs
+
+            values.append(value)
+
+        return values
 
     def _json_adapter_call_common(self, lm, lm_kwargs, signature, demos, inputs, call_fn):
         """Common call logic to be used for both sync and async calls."""
@@ -151,7 +343,10 @@ class JSONAdapter(ChatAdapter):
         return self.format_field_with_value(fields_with_values, role="assistant")
 
     def parse(self, signature: type[Signature], completion: str) -> dict[str, Any]:
-        fields = json_repair.loads(completion)
+        try:
+            fields = json_repair.loads(completion)
+        except Exception:
+            fields = ""
 
         if not isinstance(fields, dict):
             pattern = r"\{(?:[^{}]|(?R))*\}"

@@ -14,6 +14,7 @@ import logging
 import os
 import subprocess
 import threading
+import tempfile
 from os import PathLike
 from typing import Any, Callable
 
@@ -146,6 +147,7 @@ class PythonInterpreter:
         self.tools = dict(tools) if tools else {}
         self.output_fields = output_fields
         self._tools_registered = False
+        self._sandbox_cwd: str | None = None
         # TODO later on add enable_run (--allow-run) by proxying subprocess.run through Deno.run() to fix 'emscripten does not support processes' error
 
         if deno_command:
@@ -160,12 +162,22 @@ class PythonInterpreter:
             deno_dir = self._get_deno_dir()
             if deno_dir:
                 allowed_read_paths.append(deno_dir)
+                # Run Deno in a stable, non-workspace directory to avoid polluting the
+                # user's cwd and to keep sandbox dependencies readable.
+                self._sandbox_cwd = os.path.join(deno_dir, "dspy_pyodide_sandbox")
+                allowed_read_paths.append(self._sandbox_cwd)
 
             if self.enable_read_paths:
                 allowed_read_paths.extend(str(p) for p in self.enable_read_paths)
             if self.enable_write_paths:
                 allowed_read_paths.extend(str(p) for p in self.enable_write_paths)
             args.append(f"--allow-read={','.join(allowed_read_paths)}")
+
+            # Deno v2 requires an explicit node_modules mode to resolve `npm:` specifiers.
+            # Use `none` to avoid polluting the working directory with node_modules while
+            # still allowing `npm:` resolution via Deno's global cache.
+            # runner.js imports `npm:pyodide/pyodide.js`.
+            args.append("--node-modules-dir=none")
 
             self._env_arg = ""
             if self.enable_env_vars:
@@ -221,6 +233,24 @@ class PythonInterpreter:
             logger.warning("Unable to find the Deno cache dir.")
 
         return None
+
+    def _ensure_sandbox_cwd(self) -> str:
+        """Return a stable, non-workspace directory for Deno/npm artifacts.
+
+        We run the Deno subprocess in a dedicated directory to avoid polluting the
+        user's current working directory with `node_modules/` and to ensure the
+        sandbox has read access to its own dependencies.
+        """
+        if self._sandbox_cwd is None:
+            deno_dir = self._get_deno_dir()
+            if deno_dir:
+                self._sandbox_cwd = os.path.join(deno_dir, "dspy_pyodide_sandbox")
+            else:
+                # Fallback: temp dir. This may be cleaned by the OS, but keeps us out of the workspace.
+                self._sandbox_cwd = tempfile.mkdtemp(prefix="dspy_pyodide_sandbox_")
+
+        os.makedirs(self._sandbox_cwd, exist_ok=True)
+        return self._sandbox_cwd
 
     def _get_runner_path(self) -> str:
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -336,7 +366,8 @@ class PythonInterpreter:
                     stderr=subprocess.PIPE,
                     text=True,
                     encoding="UTF-8",
-                    env=os.environ.copy()
+                    env=os.environ.copy(),
+                    cwd=self._ensure_sandbox_cwd(),
                 )
             except FileNotFoundError as e:
                 install_instructions = (
